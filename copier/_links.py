@@ -22,6 +22,14 @@ class _LinkedInstance:
     children: tuple[Path, ...]
 
 
+class _LinkedAnswers(dict[str, Any]):
+    """Visible answers with an opaque reference to their instance."""
+
+    def __init__(self, path: Path, answers: dict[str, Any]) -> None:
+        super().__init__(answers)
+        self._instance_path = path
+
+
 def _answers_path(root: Path, value: str | Path) -> Path:
     """Normalize an answers path confined to a destination."""
     path = Path(value)

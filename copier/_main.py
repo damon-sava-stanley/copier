@@ -33,6 +33,7 @@ from typing import (
 from unicodedata import normalize
 
 import yaml
+from jinja2 import meta
 from jinja2.exceptions import TemplateError
 from jinja2.utils import import_string
 from packaging.version import Version
@@ -51,7 +52,13 @@ from ._jinja_ext import (
     YieldExtension,
     get_yield_context,
 )
-from ._links import _answers_path, _LinkedGraph, _source_identity
+from ._links import (
+    _answers_path,
+    _LinkedAnswers,
+    _LinkedGraph,
+    _source_identity,
+    _TemplateFor,
+)
 from ._settings import Settings, SettingsModel, is_trusted_repository
 from ._subproject import Subproject
 from ._template import Task, Template
@@ -105,6 +112,58 @@ _pathspec_pattern: Final = (
 )
 
 
+def _jinja_env_for_template(template: Template) -> SandboxedEnvironment:
+    """Create the Jinja environment configured by a template."""
+    loader = CopierTemplateLoader(template.local_abspath)
+    extensions = [
+        "jinja2_ansible_filters.AnsibleCoreFiltersExtension",
+        YieldExtension,
+        *template.jinja_extensions,
+    ]
+    envops = dict(template.envops)
+    if undefined_class := envops.get("undefined"):
+        if undefined_class in {"jinja2.Undefined", "jinja2.StrictUndefined"}:
+            envops["undefined"] = import_string(undefined_class)
+        else:
+            raise ConfigFileError(
+                f"Unsupported envops.undefined value specified: {undefined_class}.\n"
+                'Supported values are "jinja2.Undefined" and "jinja2.StrictUndefined".'
+            )
+    try:
+        env = SandboxedEnvironment(loader=loader, extensions=extensions, **envops)
+    except ModuleNotFoundError as error:
+        raise ExtensionNotFoundError(
+            f"Copier could not load some Jinja extensions:\n{error}\n"
+            "Make sure to install these extensions alongside Copier itself.\n"
+            "See the docs at https://copier.readthedocs.io/en/latest/configuring/#jinja_extensions"
+        )
+
+    def to_json_fallback(value: Any) -> Any:
+        if isinstance(value, LazyDict):
+            return dict(value)
+        if isinstance(value, PurePath):
+            return str(value)
+        return value
+
+    env.filters["to_json"] = partial(
+        env.filters["to_json"],
+        default=partial(to_jsonable_python, fallback=to_json_fallback),
+    )
+    path_type = {
+        "posix": PurePosixPath,
+        "windows": PureWindowsPath,
+        "native": PurePath,
+    }
+
+    def _pathjoin(
+        *path: str, mode: Literal["posix", "windows", "native"] = "posix"
+    ) -> str:
+        return str(path_type[mode](*path))
+
+    env.globals["pathjoin"] = _pathjoin
+    return env
+
+
 def as_operation(value: Operation) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
     """Decorator to set the current operation context, if not defined already.
 
@@ -125,7 +184,7 @@ def as_operation(value: Operation) -> Callable[[Callable[_P, _T]], Callable[_P, 
     return _decorator
 
 
-@dataclass(config=ConfigDict(extra="forbid"))
+@dataclass(config=ConfigDict(extra="forbid", arbitrary_types_allowed=True))
 class Worker:
     """Copier process state manager.
 
@@ -279,6 +338,8 @@ class Worker:
     _linked_parent: Path | None = field(default=None, init=False)
     _linked_children: tuple[Path, ...] = field(default=(), init=False)
     _new_parent_link: bool = field(default=False, init=False)
+    _linked_graph: _LinkedGraph | None = field(default=None, init=False)
+    _prompt_links_path: Path | None = field(default=None, init=False)
 
     def __enter__(self) -> Self:
         """Allow using worker as a context manager."""
@@ -484,7 +545,7 @@ class Worker:
                 "os": lambda: OS,
             }
         )
-        return dict(
+        context = dict(
             **self.answers.combined,
             _copier_answers=self._answers_to_remember(),
             _copier_conf=conf,
@@ -492,6 +553,38 @@ class Worker:
             _copier_python=sys.executable,
             _copier_phase=Phase.current(),
         )
+        if self.template.parent_template and self._linked_parent is not None:
+            context["_parent"] = self._relative_answers(self._linked_parent)
+        if self.template.accept_children:
+            context["_children"] = [
+                self._relative_answers(child) for child in self._linked_children
+            ]
+        return context
+
+    def _relative_answers(self, path: Path) -> _LinkedAnswers:
+        """Return a relative instance's recorded visible question answers."""
+        assert self._linked_graph is not None
+        instance = self._linked_graph.instances[path]
+        with _TemplateFor(instance) as template:
+            answers = AnswersMap(last=instance.answers, metadata=template.metadata)
+            context = answers.combined
+            jinja_env = _jinja_env_for_template(template)
+            visible = {
+                key: value
+                for key, value in instance.answers.items()
+                if key in template.questions_data
+                and key not in template.secret_questions
+                and not key.startswith("_")
+                and Question(
+                    answers=answers,
+                    context=context,
+                    jinja_env=jinja_env,
+                    settings=self.settings,
+                    var_name=key,
+                    **template.questions_data[key],
+                ).get_when()
+            }
+        return _LinkedAnswers(path, visible)
 
     def _path_matcher(self, patterns: Iterable[str]) -> Callable[[Path], bool]:
         """Produce a function that matches against specified patterns."""
@@ -623,6 +716,7 @@ class Worker:
         )
 
         for var_name, details in self.template.questions_data.items():
+            self._prepare_prompt_links()
             question = Question(
                 answers=self.answers,
                 context=self._render_context(),
@@ -736,58 +830,7 @@ class Worker:
 
         Respects template settings.
         """
-        loader = CopierTemplateLoader(self.template.local_abspath)
-        default_extensions = [
-            "jinja2_ansible_filters.AnsibleCoreFiltersExtension",
-            YieldExtension,
-        ]
-        extensions = default_extensions + list(self.template.jinja_extensions)
-        envops = dict(self.template.envops)
-
-        if undefined_class := envops.get("undefined"):
-            if undefined_class in {"jinja2.Undefined", "jinja2.StrictUndefined"}:
-                envops["undefined"] = import_string(undefined_class)
-            else:
-                raise ConfigFileError(
-                    f"Unsupported envops.undefined value specified: {undefined_class}.\n"
-                    'Supported values are "jinja2.Undefined" and "jinja2.StrictUndefined".'
-                )
-        try:
-            env = SandboxedEnvironment(loader=loader, extensions=extensions, **envops)
-        except ModuleNotFoundError as error:
-            raise ExtensionNotFoundError(
-                f"Copier could not load some Jinja extensions:\n{error}\n"
-                "Make sure to install these extensions alongside Copier itself.\n"
-                "See the docs at https://copier.readthedocs.io/en/latest/configuring/#jinja_extensions"
-            )
-
-        def to_json_fallback(value: Any) -> Any:
-            if isinstance(value, LazyDict):
-                return dict(value)
-            if isinstance(value, PurePath):
-                return str(value)
-            return value
-
-        # patch the `to_json` filter to support Pydantic dataclasses
-        env.filters["to_json"] = partial(
-            env.filters["to_json"],
-            default=partial(to_jsonable_python, fallback=to_json_fallback),
-        )
-
-        # Add a global function to join filesystem paths.
-        path_type = {
-            "posix": PurePosixPath,
-            "windows": PureWindowsPath,
-            "native": PurePath,
-        }
-
-        def _pathjoin(
-            *path: str, mode: Literal["posix", "windows", "native"] = "posix"
-        ) -> str:
-            return str(path_type[mode](*path))
-
-        env.globals["pathjoin"] = _pathjoin
-        return env
+        return _jinja_env_for_template(self.template)
 
     @cached_property
     def match_exclude(self) -> Callable[[Path], bool]:
@@ -1316,11 +1359,61 @@ class Worker:
             return
         self._select_parent_link(root, current_path)
 
+    def _prepare_prompt_links(self) -> None:
+        """Resolve links before prompts when the answers path is known."""
+        if (
+            not self.template.parent_template
+            and not self.template.accept_children
+            and self.parent_answers_file is None
+        ):
+            return
+        path_template = str(self.answers_file or self.template.answers_relpath)
+        self.answers.init.update(self.data)
+        dependencies = meta.find_undeclared_variables(
+            self.jinja_env.parse(path_template)
+        )
+        context = self._render_context()
+        if not dependencies.intersection({"_parent", "_children"}) and all(
+            name in context for name in dependencies
+        ):
+            path = self.answers_relpath
+            if path != self._prompt_links_path:
+                self._linked_parent = None
+                self._linked_children = ()
+                self._linked_graph = None
+                self._new_parent_link = False
+                self._prepare_links()
+                self._prompt_links_path = path
+        elif self.parent_answers_file is not None and self._linked_parent is None:
+            if self.template.parent_template is None:
+                raise UserMessageError(
+                    "`parent_answers_file` requires a template with `_parent_template`"
+                )
+            root = self.dst_path.resolve()
+            parent_path = _answers_path(root, self.parent_answers_file)
+            graph = _LinkedGraph(root)
+            parent = graph.load(parent_path)
+            if _source_identity(self.template.parent_template) != _source_identity(
+                parent.answers["_src_path"]
+            ):
+                raise UserMessageError(
+                    f"Parent repository mismatch for `{parent_path}`"
+                )
+            with _TemplateFor(parent) as parent_template:
+                if not parent_template.accept_children:
+                    raise UserMessageError(
+                        f"Parent `{parent_path}` does not accept children"
+                    )
+            self._linked_parent = parent_path
+            self._linked_graph = graph
+
     def _load_existing_links(
         self, root: Path, current_path: Path, allow_existing: bool
     ) -> None:
         """Validate an existing instance before overwriting its answers."""
-        current = _LinkedGraph(root).load(current_path)
+        graph = _LinkedGraph(root)
+        current = graph.load(current_path)
+        self._linked_graph = graph
         self._linked_parent = current.parent
         self._linked_children = current.children
         if (current.parent or current.children) and _source_identity(
@@ -1357,7 +1450,8 @@ class Worker:
             raise UserMessageError(
                 f"Answers-file path `{current_path}` is already used"
             )
-        parent = _LinkedGraph(root).load(parent_path)
+        graph = _LinkedGraph(root)
+        parent = graph.load(parent_path)
         assert self.template.parent_template is not None
         if _source_identity(self.template.parent_template) != _source_identity(
             parent.answers["_src_path"]
@@ -1376,6 +1470,7 @@ class Worker:
         finally:
             parent_template._cleanup()
         self._linked_parent = parent_path
+        self._linked_graph = graph
         self._new_parent_link = True
 
     def _persist_parent_link(self) -> None:
@@ -1409,6 +1504,7 @@ class Worker:
             del self.match_exclude
 
         self._check_unsafe("copy")
+        self._prepare_prompt_links()
         self._print_message(self.template.message_before_copy)
         with Phase.use(Phase.PROMPT):
             self._ask()
