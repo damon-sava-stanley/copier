@@ -10,7 +10,7 @@ import subprocess
 import sys
 import warnings
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from contextvars import ContextVar
 from dataclasses import field, replace
 from filecmp import dircmp
@@ -50,12 +50,14 @@ from ._jinja_ext import (
     CopierTemplateLoader,
     SandboxedEnvironment,
     YieldExtension,
+    _fragment_name,
     get_yield_context,
 )
 from ._links import (
     _answers_path,
     _LinkedAnswers,
     _LinkedGraph,
+    _LinkedInstance,
     _source_identity,
     _TemplateFor,
 )
@@ -339,6 +341,7 @@ class Worker:
     _linked_children: tuple[Path, ...] = field(default=(), init=False)
     _new_parent_link: bool = field(default=False, init=False)
     _linked_graph: _LinkedGraph | None = field(default=None, init=False)
+    _linked_current: Path | None = field(default=None, init=False)
     _prompt_links_path: Path | None = field(default=None, init=False)
 
     def __enter__(self) -> Self:
@@ -516,16 +519,24 @@ class Worker:
                 if process.returncode:
                     raise TaskError.from_process(process)
 
-    def _render_context(self) -> AnyByStrMutableMapping:
-        """Produce render context for Jinja."""
-        conf = LazyDict(
+    def _render_conf(
+        self, template: Template, instance: _LinkedInstance | None = None
+    ) -> LazyDict[str, Any]:
+        """Build configuration for the instance owning a render."""
+        return LazyDict(
             {
-                "src_path": lambda: PurePath(self.template.local_abspath),
+                "src_path": lambda: PurePath(template.local_abspath),
                 "dst_path": lambda: PurePath(self.dst_path),
-                "answers_file": lambda: PurePath(self.answers_relpath),
-                "vcs_ref": lambda: self.resolved_vcs_ref,
-                "vcs_ref_hash": lambda: self.template.commit_hash,
-                "data": lambda: self.data,
+                "answers_file": lambda: PurePath(
+                    self.answers_relpath if instance is None else instance.path
+                ),
+                "vcs_ref": lambda: (
+                    self.resolved_vcs_ref
+                    if instance is None
+                    else instance.answers.get("_commit")
+                ),
+                "vcs_ref_hash": lambda: template.commit_hash,
+                "data": lambda: self.data if instance is None else {},
                 "settings": lambda: self.settings,
                 "exclude": lambda: self.exclude,
                 "use_prereleases": lambda: self.use_prereleases,
@@ -545,10 +556,13 @@ class Worker:
                 "os": lambda: OS,
             }
         )
+
+    def _render_context(self) -> AnyByStrMutableMapping:
+        """Produce render context for Jinja."""
         context = dict(
             **self.answers.combined,
             _copier_answers=self._answers_to_remember(),
-            _copier_conf=conf,
+            _copier_conf=self._render_conf(self.template),
             _folder_name=self.subproject.local_abspath.name,
             _copier_python=sys.executable,
             _copier_phase=Phase.current(),
@@ -565,13 +579,20 @@ class Worker:
         """Return a relative instance's recorded visible question answers."""
         assert self._linked_graph is not None
         instance = self._linked_graph.instances[path]
-        with _TemplateFor(instance) as template:
-            answers = AnswersMap(last=instance.answers, metadata=template.metadata)
-            context = answers.combined
+        is_primary = path == self._linked_current
+        with (
+            nullcontext(self.template) if is_primary else _TemplateFor(instance)
+        ) as template:
+            self._check_linked_template_unsafe(template)
+            recorded = (
+                dict(self._answers_to_remember()) if is_primary else instance.answers
+            )
+            answers = AnswersMap(last=recorded, metadata=template.metadata)
+            context = self.answers.combined if is_primary else answers.combined
             jinja_env = _jinja_env_for_template(template)
             visible = {
                 key: value
-                for key, value in instance.answers.items()
+                for key, value in recorded.items()
                 if key in template.questions_data
                 and key not in template.secret_questions
                 and not key.startswith("_")
@@ -585,6 +606,107 @@ class Worker:
                 ).get_when()
             }
         return _LinkedAnswers(path, visible)
+
+    def _check_linked_template_unsafe(
+        self, template: Template, *, for_fragment: bool = False
+    ) -> None:
+        """Guard untrusted linked template features before loading them."""
+        if self.unsafe or is_trusted_repository(self.settings.trust, template.url):
+            return
+        features: set[str] = set()
+        if template.jinja_extensions:
+            features.add("jinja_extensions")
+        if for_fragment and template.tasks and not self.skip_tasks:
+            features.add("tasks")
+        if features:
+            raise UnsafeTemplateError(sorted(features))
+
+    def _fragment_external_data(
+        self,
+        template: Template,
+        env: SandboxedEnvironment,
+        context: AnyByStrDict,
+    ) -> LazyDict[str, Any]:
+        """Load external data using the fragment owner's render context."""
+
+        def load(path: str) -> Any:
+            with Phase.use(Phase.UNDEFINED):
+                rendered = env.from_string(path).render(**context)
+            if (
+                not (self.dst_path / rendered)
+                .resolve()
+                .is_relative_to(self.subproject.local_abspath)
+                and not self.unsafe
+            ):
+                raise ForbiddenPathError(path=Path(rendered))
+            return load_answersfile_data(self.dst_path, rendered, warn_on_missing=True)
+
+        def loader(path: str) -> Callable[[], Any]:
+            return lambda: load(path)
+
+        return LazyDict(
+            {key: loader(path) for key, path in template.external_data.items()}
+        )
+
+    def _render_child(
+        self,
+        child: _LinkedAnswers,
+        fragment: str,
+        *,
+        allowed_children: tuple[Path, ...] | None = None,
+    ) -> str:
+        """Render a direct child's fragment with that instance's context.
+
+        Args:
+            child: Opaque linked child answer mapping.
+            fragment: Path relative to the child's template root.
+            allowed_children: Direct children of a nested fragment's instance.
+
+        Returns:
+            Rendered fragment content.
+
+        Raises:
+            UserMessageError: The child is not linked or the fragment is missing.
+            ForbiddenPathError: The fragment escapes its template root.
+            UnsafeTemplateError: The child's template uses untrusted features.
+        """
+        if (
+            not isinstance(child, _LinkedAnswers)
+            or child._instance_path
+            not in (
+                self._linked_children if allowed_children is None else allowed_children
+            )
+            or self._linked_graph is None
+        ):
+            raise UserMessageError("Fragment target is not a direct linked child")
+        instance = self._linked_graph.instances[child._instance_path]
+        with _TemplateFor(instance) as template:
+            self._check_linked_template_unsafe(template, for_fragment=True)
+            name = _fragment_name(template.local_abspath, fragment)
+            env = _jinja_env_for_template(template)
+            env.globals["render_child"] = partial(
+                self._render_child, allowed_children=instance.children
+            )
+            context: AnyByStrDict = dict(
+                AnswersMap(last=instance.answers, metadata=template.metadata).combined
+            )
+            context.update(
+                _copier_answers=dict(instance.answers),
+                _copier_conf=self._render_conf(template, instance),
+                _folder_name=self.subproject.local_abspath.name,
+                _copier_python=sys.executable,
+                _copier_phase=Phase.current(),
+            )
+            context["_external_data"] = self._fragment_external_data(
+                template, env, context
+            )
+            if instance.parent is not None:
+                context["_parent"] = self._relative_answers(instance.parent)
+            if template.accept_children:
+                context["_children"] = [
+                    self._relative_answers(path) for path in instance.children
+                ]
+            return env.get_template(name).render(**context)
 
     def _path_matcher(self, patterns: Iterable[str]) -> Callable[[Path], bool]:
         """Produce a function that matches against specified patterns."""
@@ -830,7 +952,9 @@ class Worker:
 
         Respects template settings.
         """
-        return _jinja_env_for_template(self.template)
+        env = _jinja_env_for_template(self.template)
+        env.globals["render_child"] = self._render_child
+        return env
 
     @cached_property
     def match_exclude(self) -> Callable[[Path], bool]:
@@ -1327,6 +1451,7 @@ class Worker:
         """Validate saved links and any newly selected parent before rendering."""
         root = self.dst_path.resolve()
         current_path = _answers_path(root, self.answers_relpath)
+        self._linked_current = current_path
         if (
             not self.template.parent_template
             and not self.template.accept_children
@@ -1381,6 +1506,7 @@ class Worker:
                 self._linked_parent = None
                 self._linked_children = ()
                 self._linked_graph = None
+                self._linked_current = None
                 self._new_parent_link = False
                 self._prepare_links()
                 self._prompt_links_path = path

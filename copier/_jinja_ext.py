@@ -4,19 +4,19 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from pathlib import Path, PurePath
+from pathlib import Path, PurePath, PurePosixPath
 from typing import Any
 from weakref import WeakKeyDictionary
 
 from jinja2 import Environment, nodes
 from jinja2.exceptions import UndefinedError
 from jinja2.ext import Extension
-from jinja2.loaders import FileSystemLoader
+from jinja2.loaders import FileSystemLoader, split_template_path
 from jinja2.parser import Parser
 from jinja2.sandbox import SandboxedEnvironment as _SandboxedEnvironment
 from pydantic import BaseModel
 
-from copier.errors import ForbiddenPathError, MultipleYieldTagsError
+from copier.errors import ForbiddenPathError, MultipleYieldTagsError, UserMessageError
 
 from ._settings import SettingsModel
 
@@ -71,6 +71,11 @@ class CopierTemplateLoader(FileSystemLoader):
             ForbiddenPathError: If the source file path resolves to a path outside the
                 Copier template root.
         """
+        candidate = Path(self.searchpath[0]).joinpath(*split_template_path(template))
+        if not candidate.resolve().is_relative_to(self.searchpath[0]):
+            raise ForbiddenPathError(
+                path=candidate, hint="File path is outside the template root"
+            )
         # codespell:ignore-next-line uptodate
         source, filename, uptodate = super().get_source(environment, template)
         if not (path := Path(filename).resolve()).is_relative_to(self.searchpath[0]):
@@ -79,6 +84,33 @@ class CopierTemplateLoader(FileSystemLoader):
             )
         # codespell:ignore-next-line uptodate
         return source, filename, uptodate
+
+
+def _fragment_name(template_root: Path, fragment: str) -> str:
+    """Validate a fragment path before the loader reads it.
+
+    Args:
+        template_root: Root of the child's template checkout.
+        fragment: Requested template-relative path.
+
+    Returns:
+        A confined template name.
+
+    Raises:
+        UserMessageError: The fragment is missing or invalid.
+        ForbiddenPathError: The path resolves outside the template root.
+    """
+    if not isinstance(fragment, str) or not fragment or "\\" in fragment:
+        raise UserMessageError(f"Invalid child fragment path `{fragment}`")
+    path = PurePosixPath(fragment)
+    if path.is_absolute() or any(part in {".", ".."} for part in fragment.split("/")):
+        raise ForbiddenPathError(path=Path(fragment))
+    candidate = template_root.joinpath(*path.parts).resolve()
+    if not candidate.is_relative_to(template_root.resolve()):
+        raise ForbiddenPathError(path=Path(fragment))
+    if not candidate.is_file():
+        raise UserMessageError(f"Missing child fragment `{fragment}`")
+    return path.as_posix()
 
 
 @dataclass
