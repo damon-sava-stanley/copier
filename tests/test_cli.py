@@ -421,6 +421,8 @@ Switches:
     -l, --defaults                  Use default answers to questions, which
                                     might be null if not specified.
     -n, --pretend                   Run but do not make any changes
+    --parent-answers-file VALUE:str Answers file of the parent instance,
+                                    relative to the destination
     -q, --quiet                     Suppress status output
     -r, --vcs-ref VALUE:str         Git reference to checkout in `template_src`.
                                     If you do not specify it, it will try to

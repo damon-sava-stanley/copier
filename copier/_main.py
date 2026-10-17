@@ -32,6 +32,7 @@ from typing import (
 )
 from unicodedata import normalize
 
+import yaml
 from jinja2.exceptions import TemplateError
 from jinja2.utils import import_string
 from packaging.version import Version
@@ -50,6 +51,7 @@ from ._jinja_ext import (
     YieldExtension,
     get_yield_context,
 )
+from ._links import _answers_path, _LinkedGraph, _source_identity
 from ._settings import Settings, SettingsModel, is_trusted_repository
 from ._subproject import Subproject
 from ._template import Task, Template
@@ -251,6 +253,7 @@ class Worker:
     src_path: str | None = None
     dst_path: Path = Path()
     answers_file: RelativePath | None = None
+    parent_answers_file: RelativePath | None = None
     vcs_ref: str | VcsRef | None = None
     data: AnyByStrDict = field(default_factory=dict)
     settings: SettingsModel = field(default_factory=SettingsModel.from_file)
@@ -269,9 +272,13 @@ class Worker:
     skip_answered: bool = False
     skip_tasks: bool = False
     ask: Sequence[str] = ()
+    _recopying: bool = False
 
     answers: AnswersMap = field(default_factory=AnswersMap, init=False)
     _cleanup_hooks: list[Callable[[], None]] = field(default_factory=list, init=False)
+    _linked_parent: Path | None = field(default=None, init=False)
+    _linked_children: tuple[Path, ...] = field(default=(), init=False)
+    _new_parent_link: bool = field(default=False, init=False)
 
     def __enter__(self) -> Self:
         """Allow using worker as a context manager."""
@@ -383,6 +390,10 @@ class Worker:
         for key, value in (("_commit", commit), ("_src_path", src)):
             if value is not None:
                 answers[key] = value
+        if self._linked_parent is not None:
+            answers["_parent"] = self._linked_parent.as_posix()
+        if self._linked_children:
+            answers["_children"] = [child.as_posix() for child in self._linked_children]
         # Other data goes next
         answers.update(
             (str(k), v)
@@ -1269,6 +1280,118 @@ class Worker:
         return path
 
     # Main operations
+    def _prepare_links(self, allow_existing: bool = False) -> None:
+        """Validate saved links and any newly selected parent before rendering."""
+        root = self.dst_path.resolve()
+        current_path = _answers_path(root, self.answers_relpath)
+        if (
+            not self.template.parent_template
+            and not self.template.accept_children
+            and self.parent_answers_file is None
+        ):
+            if not (root / current_path).is_file():
+                return
+            saved = load_answersfile_data(root, current_path)
+            if (
+                not isinstance(saved, dict)
+                or not {"_parent", "_children"} & saved.keys()
+            ):
+                return
+        if (root / current_path).exists():
+            self._load_existing_links(root, current_path, allow_existing)
+        if not self.template.parent_template:
+            if self.parent_answers_file is not None:
+                raise UserMessageError(
+                    "`parent_answers_file` requires a template with `_parent_template`"
+                )
+            return
+        if (root / current_path).exists():
+            if (
+                self.parent_answers_file is not None
+                and _answers_path(root, self.parent_answers_file) != self._linked_parent
+            ):
+                raise UserMessageError(
+                    f"Selected parent differs from saved link in `{current_path}`"
+                )
+            return
+        self._select_parent_link(root, current_path)
+
+    def _load_existing_links(
+        self, root: Path, current_path: Path, allow_existing: bool
+    ) -> None:
+        """Validate an existing instance before overwriting its answers."""
+        current = _LinkedGraph(root).load(current_path)
+        self._linked_parent = current.parent
+        self._linked_children = current.children
+        if (current.parent or current.children) and _source_identity(
+            current.answers["_src_path"]
+        ) != _source_identity(self.template.url):
+            raise UserMessageError(
+                f"Template repository mismatch for linked `{current_path}`"
+            )
+        if current.parent and not self.template.parent_template:
+            raise UserMessageError(
+                f"Template for `{current_path}` no longer declares its parent"
+            )
+        if self.template.parent_template and not self._linked_parent:
+            raise UserMessageError(
+                f"Linked template `{current_path}` has no saved `_parent`"
+            )
+        if self._linked_children and not self.template.accept_children:
+            raise UserMessageError(
+                f"Template for `{current_path}` no longer accepts children"
+            )
+        if self.template.parent_template and not (self._recopying or allow_existing):
+            raise UserMessageError(
+                f"Answers-file path `{current_path}` is already used"
+            )
+
+    def _select_parent_link(self, root: Path, current_path: Path) -> None:
+        """Validate the requested parent for a first child copy."""
+        if self.parent_answers_file is None:
+            raise UserMessageError(
+                f"Template `{current_path}` requires --parent-answers-file"
+            )
+        parent_path = _answers_path(root, self.parent_answers_file)
+        if parent_path == current_path:
+            raise UserMessageError(
+                f"Answers-file path `{current_path}` is already used"
+            )
+        parent = _LinkedGraph(root).load(parent_path)
+        assert self.template.parent_template is not None
+        if _source_identity(self.template.parent_template) != _source_identity(
+            parent.answers["_src_path"]
+        ):
+            raise UserMessageError(
+                f"Parent repository mismatch for `{current_path}` and `{parent_path}`"
+            )
+        parent_template = Template(
+            url=parent.answers["_src_path"], ref=parent.answers.get("_commit")
+        )
+        try:
+            if not parent_template.accept_children:
+                raise UserMessageError(
+                    f"Parent `{parent_path}` does not accept child `{current_path}`"
+                )
+        finally:
+            parent_template._cleanup()
+        self._linked_parent = parent_path
+        self._new_parent_link = True
+
+    def _persist_parent_link(self) -> None:
+        """Append a newly attached child to its parent's answers file."""
+        if not self._new_parent_link or self.pretend:
+            return
+        assert self._linked_parent is not None
+        root = self.dst_path.resolve()
+        parent_path = root / self._linked_parent
+        parent_answers = load_answersfile_data(root, self._linked_parent)
+        children = parent_answers.setdefault("_children", [])
+        current_path = _answers_path(root, self.answers_relpath).as_posix()
+        if current_path not in children:
+            children.append(current_path)
+        parent_path.write_text(yaml.safe_dump(parent_answers, sort_keys=False))
+
     @as_operation("copy")
     def run_copy(self) -> None:
         """Generate a subproject from zero, ignoring what was in the folder.
@@ -1289,6 +1412,7 @@ class Worker:
         self._print_message(self.template.message_before_copy)
         with Phase.use(Phase.PROMPT):
             self._ask()
+        self._prepare_links()
         was_existing = self.subproject.local_abspath.exists()
         try:
             if not self.quiet:
@@ -1299,6 +1423,7 @@ class Worker:
                 )
             with Phase.use(Phase.RENDER):
                 self._render_template()
+            self._persist_parent_link()
             if not self.quiet:
                 # TODO Unify printing tools
                 print()  # padding space
@@ -1332,7 +1457,9 @@ class Worker:
                 "Cannot recopy because cannot obtain old template references "
                 f"from `{self.subproject.answers_relpath}`."
             )
-        with replace(self, src_path=self.subproject.template.url) as new_worker:
+        with replace(
+            self, src_path=self.subproject.template.url, _recopying=True
+        ) as new_worker:
             new_worker.run_copy()
 
     def _print_template_update_info(self, subproject_template: Template) -> None:
@@ -1350,6 +1477,7 @@ class Worker:
 
         See [updating a project][updating-a-project].
         """
+        self._prepare_links(allow_existing=True)
         self._check_unsafe("update")
         # Check all you need is there
         if self.subproject.vcs != "git":
@@ -1749,6 +1877,7 @@ def run_copy(
     data: dict[str, Any] | None = None,
     *,
     answers_file: Path | str | None = None,
+    parent_answers_file: Path | str | None = None,
     vcs_ref: str | VcsRef | None = None,
     settings: Settings | SettingsModel | None = None,
     exclude: Sequence[str] = (),
@@ -1773,6 +1902,11 @@ def run_copy(
             RelativePath(answers_file)
             if isinstance(answers_file, str)
             else answers_file
+        ),
+        parent_answers_file=(
+            RelativePath(parent_answers_file)
+            if isinstance(parent_answers_file, str)
+            else parent_answers_file
         ),
         vcs_ref=vcs_ref,
         settings=(

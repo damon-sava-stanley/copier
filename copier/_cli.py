@@ -222,6 +222,12 @@ class CopierCopySubApp(_Subcommand):
 
     DESCRIPTION = "Copy from a template source to a destination."
 
+    parent_answers_file = cli.SwitchAttr(
+        ["--parent-answers-file"],
+        default=None,
+        help="Answers file of the parent instance, relative to the destination",
+    )
+
     cleanup_on_error = cli.Flag(
         ["-C", "--no-cleanup"],
         default=True,
@@ -268,6 +274,7 @@ class CopierCopySubApp(_Subcommand):
                 destination_path,
                 data=self.data,
                 answers_file=self.answers_file,
+                parent_answers_file=self.parent_answers_file,
                 vcs_ref=try_enum(VcsRef, self.vcs_ref),
                 exclude=self.exclude,
                 use_prereleases=self.prereleases,

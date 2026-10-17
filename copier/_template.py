@@ -294,6 +294,22 @@ class Template:
         return result
 
     @cached_property
+    def accept_children(self) -> bool:
+        """Whether this template permits linked child instances."""
+        value = self.config_data.get("accept_children", False)
+        if not isinstance(value, bool):
+            raise InvalidConfigFileError(self.local_abspath / "copier.yml", False)
+        return value
+
+    @cached_property
+    def parent_template(self) -> str | None:
+        """Repository declared as this template's parent."""
+        value = self.config_data.get("parent_template")
+        if value is not None and (not isinstance(value, str) or not value):
+            raise InvalidConfigFileError(self.local_abspath / "copier.yml", False)
+        return value
+
+    @cached_property
     def commit(self) -> str | None:
         """If the template is VCS-tracked, get its commit description."""
         if self.vcs == "git":
