@@ -1699,13 +1699,15 @@ class Worker:
             parent = graph.instances[parent].parent
         return tuple(ordered)
 
-    def _dependent_worker(self, graph: _LinkedGraph, path: Path) -> Worker:
+    def _dependent_worker(
+        self, graph: _LinkedGraph, path: Path, dst_path: Path | None = None
+    ) -> Worker:
         """Open a saved instance for a render without primary side effects."""
         instance = graph.instances[path]
         worker = Worker(
             src_path=instance.answers["_src_path"],
             vcs_ref=instance.answers.get("_commit"),
-            dst_path=self.dst_path,
+            dst_path=self.dst_path if dst_path is None else dst_path,
             answers_file=RelativePath(path),
             settings=self.settings,
             exclude=self.exclude,
@@ -1771,18 +1773,46 @@ class Worker:
                         )
                 owners[output] = path
 
-    def _rerender_dependents(self, graph: _LinkedGraph) -> None:
+    def _rerender_dependents(
+        self, graph: _LinkedGraph, destination: Path | None = None
+    ) -> None:
         """Render affected relatives at their saved revisions and answers."""
         assert self._linked_current is not None
         for path in self._affected_paths(graph, self._linked_current):
-            with self._dependent_worker(graph, path) as worker, Phase.use(Phase.RENDER):
+            with (
+                self._dependent_worker(graph, path, destination) as worker,
+                Phase.use(Phase.RENDER),
+            ):
                 worker._render_template()
 
-    def _seed_linked_answers(self, destination: Path) -> None:
+    def _update_skip_matcher(
+        self, old_graph: _LinkedGraph | None, new_graph: _LinkedGraph | None
+    ) -> Callable[[Path], bool]:
+        """Match update paths against their owning instance's skip policy."""
+        owners: dict[Path, Callable[[Path], bool]] = {}
+        for graph in (old_graph, new_graph):
+            if graph is None:
+                continue
+            assert self._linked_current is not None
+            for path in self._affected_paths(graph, self._linked_current):
+                with self._dependent_worker(graph, path) as worker:
+                    for output in worker._output_paths():
+                        owners[output] = worker.match_skip
+
+        def match(path: Path) -> bool:
+            matcher = owners.get(path, self.match_skip)
+            return matcher(path)
+
+        return match
+
+    def _seed_linked_answers(
+        self, destination: Path, graph: _LinkedGraph | None = None
+    ) -> None:
         """Give a temporary update render its complete saved link graph."""
-        if self._linked_graph is None:
+        graph = self._linked_graph if graph is None else graph
+        if graph is None:
             return
-        for path, instance in self._linked_graph.instances.items():
+        for path, instance in graph.instances.items():
             target = destination / path
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(yaml.safe_dump(instance.answers, sort_keys=False))
@@ -1941,11 +1971,6 @@ class Worker:
             del self.match_exclude
 
         self._apply_update()
-        if self._linked_graph is not None:
-            graph = _LinkedGraph(self.dst_path.resolve())
-            assert self._linked_current is not None
-            graph.load(self._linked_current)
-            self._rerender_dependents(graph)
         self._print_message(self.template.message_after_update)
 
     def _apply_update(self) -> None:  # noqa: C901
@@ -1965,6 +1990,7 @@ class Worker:
                 prefix=f"{__name__}.new_copy.",
             ) as new_copy,
         ):
+            old_graph = self._linked_graph
             self._seed_linked_answers(Path(old_copy) / subproject_subdir)
             # Copy old template into a temporary destination
             with replace(
@@ -1985,6 +2011,11 @@ class Worker:
                 _preanswered=None,
             ) as old_worker:
                 old_worker.run_copy()
+            if old_graph is not None:
+                self._rerender_dependents(
+                    old_graph, Path(old_copy) / subproject_subdir
+                )
+            old_match_skip = self._update_skip_matcher(old_graph, None)
             # Run pre-migration tasks
             with Phase.use(Phase.MIGRATE):
                 self._execute_tasks(
@@ -2016,7 +2047,7 @@ class Worker:
                         ).splitlines(),
                     )
                     if not (subproject_top / path).exists()
-                    and not self.match_skip(Path(path))
+                    and not old_match_skip(Path(path).relative_to(subproject_subdir))
                 ]
             # Clear last answers cache to load possible answers migration, if
             # skip_answered flag is not set
@@ -2047,11 +2078,17 @@ class Worker:
                 current_worker.run_copy()
                 self.answers = current_worker.answers
                 self.answers.external = self._external_data()
+            new_graph = None
+            if old_graph is not None:
+                new_graph = _LinkedGraph(self.dst_path.resolve())
+                assert self._linked_current is not None
+                new_graph.load(self._linked_current)
+                self._rerender_dependents(new_graph)
             # Don't regenerate intentionally deleted paths
             for filename in files_removed:
                 (subproject_top / filename).unlink(missing_ok=True)
             # Render with the same answers in an empty dir to avoid pollution
-            self._seed_linked_answers(Path(new_copy) / subproject_subdir)
+            self._seed_linked_answers(Path(new_copy) / subproject_subdir, new_graph)
             with replace(
                 self,
                 dst_path=new_copy / subproject_subdir,
@@ -2073,6 +2110,11 @@ class Worker:
                 _preanswered=None,
             ) as new_worker:
                 new_worker.run_copy()
+            if new_graph is not None:
+                self._rerender_dependents(
+                    new_graph, Path(new_copy) / subproject_subdir
+                )
+            match_skip = self._update_skip_matcher(old_graph, new_graph)
             # Don't regenerate intentionally deleted paths
             for filename in files_removed:
                 Path(new_copy, filename).unlink(missing_ok=True)
@@ -2132,7 +2174,7 @@ class Worker:
                             subproject_subdir,
                         ).splitlines(),
                     )
-                    if self.match_skip(Path(f).relative_to(subproject_subdir))
+                    if match_skip(Path(f).relative_to(subproject_subdir))
                 ]
                 try:
                     diff = diff_cmd("--inter-hunk-context=-1")
