@@ -334,6 +334,9 @@ class Worker:
     skip_tasks: bool = False
     ask: Sequence[str] = ()
     _recopying: bool = False
+    _orchestrate: bool = True
+    _dependent_render: bool = False
+    _preanswered: AnswersMap | None = None
 
     answers: AnswersMap = field(default_factory=AnswersMap, init=False)
     _cleanup_hooks: list[Callable[[], None]] = field(default_factory=list, init=False)
@@ -343,6 +346,7 @@ class Worker:
     _linked_graph: _LinkedGraph | None = field(default=None, init=False)
     _linked_current: Path | None = field(default=None, init=False)
     _prompt_links_path: Path | None = field(default=None, init=False)
+    _linked_templates: dict[Path, Template] = field(default_factory=dict, init=False)
 
     def __enter__(self) -> Self:
         """Allow using worker as a context manager."""
@@ -580,32 +584,40 @@ class Worker:
         assert self._linked_graph is not None
         instance = self._linked_graph.instances[path]
         is_primary = path == self._linked_current
-        with (
-            nullcontext(self.template) if is_primary else _TemplateFor(instance)
-        ) as template:
-            self._check_linked_template_unsafe(template)
-            recorded = (
-                dict(self._answers_to_remember()) if is_primary else instance.answers
-            )
-            answers = AnswersMap(last=recorded, metadata=template.metadata)
-            context = self.answers.combined if is_primary else answers.combined
-            jinja_env = _jinja_env_for_template(template)
-            visible = {
-                key: value
-                for key, value in recorded.items()
-                if key in template.questions_data
-                and key not in template.secret_questions
-                and not key.startswith("_")
-                and Question(
-                    answers=answers,
-                    context=context,
-                    jinja_env=jinja_env,
-                    settings=self.settings,
-                    var_name=key,
-                    **template.questions_data[key],
-                ).get_when()
-            }
+        template = self.template if is_primary else self._linked_template(path)
+        self._check_linked_template_unsafe(template)
+        recorded = dict(self._answers_to_remember()) if is_primary else instance.answers
+        answers = AnswersMap(last=recorded, metadata=template.metadata)
+        context = self.answers.combined if is_primary else answers.combined
+        jinja_env = _jinja_env_for_template(template)
+        visible = {
+            key: value
+            for key, value in recorded.items()
+            if key in template.questions_data
+            and key not in template.secret_questions
+            and not key.startswith("_")
+            and Question(
+                answers=answers,
+                context=context,
+                jinja_env=jinja_env,
+                settings=self.settings,
+                var_name=key,
+                **template.questions_data[key],
+            ).get_when()
+        }
         return _LinkedAnswers(path, visible)
+
+    def _linked_template(self, path: Path) -> Template:
+        """Reuse a recorded checkout for this worker's lifetime."""
+        if path not in self._linked_templates:
+            assert self._linked_graph is not None
+            instance = self._linked_graph.instances[path]
+            template = Template(
+                url=instance.answers["_src_path"], ref=instance.answers.get("_commit")
+            )
+            self._linked_templates[path] = template
+            self._cleanup_hooks.append(template._cleanup)
+        return self._linked_templates[path]
 
     def _check_linked_template_unsafe(
         self, template: Template, *, for_fragment: bool = False
@@ -680,7 +692,7 @@ class Worker:
         ):
             raise UserMessageError("Fragment target is not a direct linked child")
         instance = self._linked_graph.instances[child._instance_path]
-        with _TemplateFor(instance) as template:
+        with nullcontext(self._linked_template(child._instance_path)) as template:
             self._check_linked_template_unsafe(template, for_fragment=True)
             name = _fragment_name(template.local_abspath, fragment)
             env = _jinja_env_for_template(template)
@@ -1003,6 +1015,8 @@ class Worker:
                 Path(src_abspath).relative_to(self.template_copy_root)
             )
             for dst_relpath, ctx in dst_relpaths_ctxs:
+                if self._dependent_render and dst_relpath == self.answers_relpath:
+                    continue
                 dst_abspath = dst_root / dst_relpath
                 if dst_abspath.is_symlink():
                     # If destination path is a symlink, it can safely point outside the
@@ -1447,11 +1461,35 @@ class Worker:
         return path
 
     # Main operations
+    def _check_answers_owner(self, root: Path, current_path: Path) -> None:
+        """Identify a saved component file occupying a new answers path."""
+        if (
+            not self.template.parent_template
+            or self.parent_answers_file is None
+            or not (root / current_path).exists()
+        ):
+            return
+        parent_path = _answers_path(root, self.parent_answers_file)
+        if parent_path == current_path:
+            return
+        graph = _LinkedGraph(root)
+        graph.load(parent_path)
+        for path in graph.instances:
+            if path == current_path:
+                continue
+            with self._dependent_worker(graph, path) as worker:
+                if current_path in worker._output_paths():
+                    raise UserMessageError(
+                        f"Output `{current_path}` is owned by both `{path}` "
+                        f"and `{current_path}`"
+                    )
+
     def _prepare_links(self, allow_existing: bool = False) -> None:
         """Validate saved links and any newly selected parent before rendering."""
         root = self.dst_path.resolve()
         current_path = _answers_path(root, self.answers_relpath)
         self._linked_current = current_path
+        self._check_answers_owner(root, current_path)
         if (
             not self.template.parent_template
             and not self.template.accept_children
@@ -1508,7 +1546,7 @@ class Worker:
                 self._linked_graph = None
                 self._linked_current = None
                 self._new_parent_link = False
-                self._prepare_links()
+                self._prepare_links(allow_existing=_operation.get() == "update")
                 self._prompt_links_path = path
         elif self.parent_answers_file is not None and self._linked_parent is None:
             if self.template.parent_template is None:
@@ -1613,8 +1651,144 @@ class Worker:
             children.append(current_path)
         parent_path.write_text(yaml.safe_dump(parent_answers, sort_keys=False))
 
+    def _planned_graph(self) -> _LinkedGraph | None:
+        """Build the postoperation graph with the primary's current answers."""
+        if self._linked_graph is None or self._linked_current is None:
+            return None
+        graph = _LinkedGraph(self.dst_path.resolve())
+        graph.instances = {
+            path: _LinkedInstance(
+                path, dict(instance.answers), instance.parent, instance.children
+            )
+            for path, instance in self._linked_graph.instances.items()
+        }
+        path = self._linked_current
+        graph.instances[path] = _LinkedInstance(
+            path,
+            dict(self._answers_to_remember()),
+            self._linked_parent,
+            self._linked_children,
+        )
+        if self._new_parent_link:
+            assert self._linked_parent is not None
+            parent = graph.instances[self._linked_parent]
+            parent.children = (*parent.children, path)
+            parent.answers["_children"] = [
+                child.as_posix() for child in parent.children
+            ]
+        return graph
+
+    @staticmethod
+    def _affected_paths(graph: _LinkedGraph, primary: Path) -> tuple[Path, ...]:
+        """Order descendants before ancestors without expanding side branches."""
+        ordered: list[Path] = []
+        seen = {primary}
+
+        def descendants(path: Path) -> None:
+            for child in graph.instances[path].children:
+                if child not in seen:
+                    seen.add(child)
+                    ordered.append(child)
+                    descendants(child)
+
+        descendants(primary)
+        parent = graph.instances[primary].parent
+        while parent is not None and parent not in seen:
+            seen.add(parent)
+            ordered.append(parent)
+            parent = graph.instances[parent].parent
+        return tuple(ordered)
+
+    def _dependent_worker(self, graph: _LinkedGraph, path: Path) -> Worker:
+        """Open a saved instance for a render without primary side effects."""
+        instance = graph.instances[path]
+        worker = Worker(
+            src_path=instance.answers["_src_path"],
+            vcs_ref=instance.answers.get("_commit"),
+            dst_path=self.dst_path,
+            answers_file=RelativePath(path),
+            settings=self.settings,
+            exclude=self.exclude,
+            skip_if_exists=self.skip_if_exists,
+            defaults=True,
+            overwrite=self.overwrite,
+            pretend=self.pretend,
+            quiet=self.quiet,
+            unsafe=self.unsafe,
+            skip_tasks=True,
+            _orchestrate=False,
+            _dependent_render=True,
+        )
+        worker.answers = AnswersMap(
+            last=instance.answers, metadata=worker.template.metadata
+        )
+        worker._linked_graph = graph
+        worker._linked_current = path
+        worker._linked_parent = instance.parent
+        worker._linked_children = instance.children
+        return worker
+
+    def _output_paths(self) -> set[Path]:
+        """Collect files this instance would generate."""
+        paths = {self.answers_relpath}
+        for src in scantree(
+            str(self.template_copy_root),
+            follow_symlinks=not self.template.preserve_symlinks,
+        ):
+            if src.is_dir(follow_symlinks=not self.template.preserve_symlinks):
+                continue
+            relpath = Path(src.path).relative_to(self.template_copy_root)
+            for output, _context in self._render_path(relpath):
+                if not self.match_exclude(output):
+                    paths.add(_answers_path(self.dst_path.resolve(), output))
+        return paths
+
+    def _validate_output_owners(self, graph: _LinkedGraph) -> None:
+        """Reject generated paths claimed by two linked instances."""
+        owners: dict[Path, Path] = {}
+        assert self._linked_current is not None
+        for path in graph.instances:
+            if path == self._linked_current:
+                previous_graph = self._linked_graph
+                self._linked_graph = graph
+                try:
+                    outputs = self._output_paths()
+                finally:
+                    self._linked_graph = previous_graph
+            else:
+                with self._dependent_worker(graph, path) as worker:
+                    outputs = worker._output_paths()
+            for output in outputs:
+                for existing, owner in owners.items():
+                    if owner != path and (
+                        output == existing
+                        or output in existing.parents
+                        or existing in output.parents
+                    ):
+                        raise UserMessageError(
+                            f"Output `{output}` conflicts with `{existing}` "
+                            f"owned by `{owner}` and `{path}`"
+                        )
+                owners[output] = path
+
+    def _rerender_dependents(self, graph: _LinkedGraph) -> None:
+        """Render affected relatives at their saved revisions and answers."""
+        assert self._linked_current is not None
+        for path in self._affected_paths(graph, self._linked_current):
+            with self._dependent_worker(graph, path) as worker, Phase.use(Phase.RENDER):
+                worker._render_template()
+
+    def _seed_linked_answers(self, destination: Path) -> None:
+        """Give a temporary update render its complete saved link graph."""
+        if self._linked_graph is None:
+            return
+        for path, instance in self._linked_graph.instances.items():
+            target = destination / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(yaml.safe_dump(instance.answers, sort_keys=False))
+
     @as_operation("copy")
-    def run_copy(self) -> None:
+    def run_copy(self) -> None:  # noqa: C901
         """Generate a subproject from zero, ignoring what was in the folder.
 
         If `dst_path` was missing, it will be
@@ -1633,8 +1807,14 @@ class Worker:
         self._prepare_prompt_links()
         self._print_message(self.template.message_before_copy)
         with Phase.use(Phase.PROMPT):
-            self._ask()
+            if self._preanswered is None:
+                self._ask()
+            else:
+                self.answers = self._preanswered
         self._prepare_links()
+        graph = self._planned_graph() if self._orchestrate else None
+        if graph is not None:
+            self._validate_output_owners(graph)
         was_existing = self.subproject.local_abspath.exists()
         try:
             if not self.quiet:
@@ -1652,6 +1832,11 @@ class Worker:
             if not self.skip_tasks:
                 with Phase.use(Phase.TASKS):
                     self._execute_tasks(self.template.tasks)
+            if graph is not None and not self.pretend:
+                graph = _LinkedGraph(self.dst_path.resolve())
+                assert self._linked_current is not None
+                graph.load(self._linked_current)
+                self._rerender_dependents(graph)
         except Exception:
             if not was_existing and self.cleanup_on_error:
                 try:
@@ -1694,7 +1879,7 @@ class Worker:
             print(message, file=sys.stderr)
 
     @as_operation("update")
-    def run_update(self) -> None:
+    def run_update(self) -> None:  # noqa: C901
         """Update a subproject that was already generated.
 
         See [updating a project][updating-a-project].
@@ -1736,6 +1921,18 @@ class Worker:
             # review the diff before committing; so we can safely avoid
             # asking for confirmation
             raise UserMessageError("Enable overwrite to update a subproject.")
+        if self._linked_graph is not None:
+            if self.template.migration_tasks("before", self.subproject.template):
+                self.answers = AnswersMap(
+                    last=self.subproject.last_answers, metadata=self.template.metadata
+                )
+            else:
+                with Phase.use(Phase.PROMPT):
+                    self._ask()
+                self._preanswered = self.answers
+            graph = self._planned_graph()
+            assert graph is not None
+            self._validate_output_owners(graph)
         self._print_message(self.template.message_before_update)
         self._print_template_update_info(self.subproject.template)
         with suppress(AttributeError):
@@ -1744,6 +1941,11 @@ class Worker:
             del self.match_exclude
 
         self._apply_update()
+        if self._linked_graph is not None:
+            graph = _LinkedGraph(self.dst_path.resolve())
+            assert self._linked_current is not None
+            graph.load(self._linked_current)
+            self._rerender_dependents(graph)
         self._print_message(self.template.message_after_update)
 
     def _apply_update(self) -> None:  # noqa: C901
@@ -1763,6 +1965,7 @@ class Worker:
                 prefix=f"{__name__}.new_copy.",
             ) as new_copy,
         ):
+            self._seed_linked_answers(Path(old_copy) / subproject_subdir)
             # Copy old template into a temporary destination
             with replace(
                 self,
@@ -1777,6 +1980,9 @@ class Worker:
                 # https://github.com/orgs/copier-org/discussions/2345
                 exclude=[*self.template.exclude, *self.exclude],
                 ask=(),
+                _recopying=True,
+                _orchestrate=False,
+                _preanswered=None,
             ) as old_worker:
                 old_worker.run_copy()
             # Run pre-migration tasks
@@ -1814,7 +2020,7 @@ class Worker:
                 ]
             # Clear last answers cache to load possible answers migration, if
             # skip_answered flag is not set
-            if self.skip_answered is False:
+            if self.skip_answered is False and self._preanswered is None:
                 self.answers = AnswersMap(external=self._external_data())
                 with suppress(AttributeError):
                     del self.subproject.last_answers
@@ -1826,7 +2032,18 @@ class Worker:
                 # say nothing than lie.
                 # TODO
                 quiet=True,
+                _recopying=True,
+                _orchestrate=False,
+                _preanswered=self._preanswered,
             ) as current_worker:
+                if self._linked_graph is not None and self._preanswered is None:
+                    current_worker._prepare_links(allow_existing=True)
+                    with Phase.use(Phase.PROMPT):
+                        current_worker._ask()
+                    graph = current_worker._planned_graph()
+                    assert graph is not None
+                    current_worker._validate_output_owners(graph)
+                    current_worker._preanswered = current_worker.answers
                 current_worker.run_copy()
                 self.answers = current_worker.answers
                 self.answers.external = self._external_data()
@@ -1834,6 +2051,7 @@ class Worker:
             for filename in files_removed:
                 (subproject_top / filename).unlink(missing_ok=True)
             # Render with the same answers in an empty dir to avoid pollution
+            self._seed_linked_answers(Path(new_copy) / subproject_subdir)
             with replace(
                 self,
                 dst_path=new_copy / subproject_subdir,
@@ -1850,6 +2068,9 @@ class Worker:
                 src_path=self.subproject.template.url,  # type: ignore[union-attr]
                 vcs_ref=self.resolved_vcs_ref,
                 ask=(),
+                _recopying=True,
+                _orchestrate=False,
+                _preanswered=None,
             ) as new_worker:
                 new_worker.run_copy()
             # Don't regenerate intentionally deleted paths

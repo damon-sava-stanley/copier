@@ -23,6 +23,7 @@ class _SideEffectJinjaExtension(Extension):
 
 def _template(path: Path, config: str, files: dict[str, str]) -> None:
     """Create a template with a generated answers file."""
+    config = config.replace("_exclude: [", "_exclude: ['copier.yml', ")
     output_root = path / "output" if "_subdirectory: output" in config else path
     build_file_tree(
         {
@@ -66,6 +67,7 @@ def test_parent_renders_two_child_instances_with_separate_contexts(
             data={"name": name},
             defaults=True,
             quiet=True,
+            overwrite=True,
         )
 
     run_recopy(
@@ -103,6 +105,7 @@ def test_parent_recopy_fragment_sees_new_parent_answer(tmp_path: Path) -> None:
         parent_answers_file="parent.yml",
         defaults=True,
         quiet=True,
+        overwrite=True,
     )
 
     run_recopy(
@@ -137,7 +140,7 @@ def test_fragment_uses_child_configuration_and_copier_context(tmp_path: Path) ->
     _template(
         middle,
         f"_accept_children: true\n_parent_template: {root}\n"
-        "_exclude: ['middle.jinja']\n"
+        "_exclude: ['middle']\n"
         "_external_data:\n  extra: middle-extra.yml\nname: middle\n",
         {
             "middle-extra.yml": "token: middle-data\n",
@@ -153,7 +156,7 @@ def test_fragment_uses_child_configuration_and_copier_context(tmp_path: Path) ->
     )
     _template(
         leaf,
-        f"_parent_template: {middle}\n_exclude: ['leaf.jinja']\n"
+        f"_parent_template: {middle}\n_exclude: ['leaf']\n"
         "_external_data:\n  extra: leaf-extra.yml\nname: leaf\n",
         {
             "leaf-extra.yml": "token: leaf-data\n",
@@ -165,6 +168,7 @@ def test_fragment_uses_child_configuration_and_copier_context(tmp_path: Path) ->
         },
     )
     run_copy(str(root), dst, answers_file="root.yml", defaults=True, quiet=True)
+    build_file_tree({dst / "middle-extra.yml": "token: middle-data\n"})
     run_copy(
         str(middle),
         dst,
@@ -215,7 +219,9 @@ def test_three_level_fragment_uses_each_instance_context(tmp_path: Path) -> None
         {
             "middle.jinja": (
                 "{{ name }}@{{ _parent.name }}:"
+                "{% if _children %}"
                 "{{ render_child(_children[0], 'leaf.jinja') }}"
+                "{% endif %}"
             ),
             "output/middle.txt.jinja": "{{ name }}",
         },
@@ -233,6 +239,7 @@ def test_three_level_fragment_uses_each_instance_context(tmp_path: Path) -> None
         parent_answers_file="root.yml",
         defaults=True,
         quiet=True,
+        overwrite=True,
     )
     run_copy(
         str(leaf),
@@ -241,6 +248,7 @@ def test_three_level_fragment_uses_each_instance_context(tmp_path: Path) -> None
         parent_answers_file="middle.yml",
         defaults=True,
         quiet=True,
+        overwrite=True,
     )
 
     run_recopy(dst, answers_file="root.yml", defaults=True, quiet=True, overwrite=True)
@@ -290,6 +298,7 @@ def test_fragment_uses_child_jinja_settings_and_recorded_revision(
         parent_answers_file="parent.yml",
         defaults=True,
         quiet=True,
+        overwrite=True,
     )
     (child / "fragment.jinja").write_text("new revision")
     git_save(child, tag="v2.0.0")
@@ -330,6 +339,7 @@ def test_untrusted_child_extension_blocks_fragment(
         parent_answers_file="parent.yml",
         defaults=True,
         quiet=True,
+        overwrite=True,
     )
     marker = tmp_path / "extension-loaded"
     monkeypatch.setenv("COPIER_FRAGMENT_EXTENSION_MARKER", str(marker))
@@ -370,23 +380,17 @@ def test_bad_fragment_path_fails(tmp_path: Path, fragment: str) -> None:
     _template(child, f"_parent_template: {parent}\n", {})
     (tmp_path / "outside.jinja").write_text("PRIVATE")
     run_copy(str(parent), dst, answers_file="parent.yml", defaults=True, quiet=True)
-    run_copy(
-        str(child),
-        dst,
-        answers_file="child.yml",
-        parent_answers_file="parent.yml",
-        defaults=True,
-        quiet=True,
-    )
     if fragment == "escape.jinja":
         (child / fragment).symlink_to(tmp_path / "outside.jinja")
 
     with pytest.raises(
         (UserMessageError, ForbiddenPathError), match="fragment|forbidden"
     ):
-        run_recopy(
+        run_copy(
+            str(child),
             dst,
-            answers_file="parent.yml",
+            answers_file="child.yml",
+            parent_answers_file="parent.yml",
             defaults=True,
             quiet=True,
             overwrite=True,

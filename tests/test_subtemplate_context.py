@@ -54,6 +54,7 @@ def test_repeated_children_render_in_order_with_separate_answers(
             data={"name": name},
             defaults=True,
             quiet=True,
+            overwrite=True,
         )
 
     run_recopy(
@@ -131,19 +132,27 @@ def test_three_level_contexts_include_only_direct_relatives(tmp_path: Path) -> N
     )
     run_copy(str(root), dst, answers_file="root.yml", defaults=True, quiet=True)
     run_copy(
-        str(middle), dst, answers_file="middle.yml", parent_answers_file="root.yml",
-        defaults=True, quiet=True,
+        str(middle),
+        dst,
+        answers_file="middle.yml",
+        parent_answers_file="root.yml",
+        defaults=True,
+        quiet=True,
+        overwrite=True,
     )
     run_copy(
-        str(leaf), dst, answers_file="leaf.yml", parent_answers_file="middle.yml",
-        defaults=True, quiet=True,
+        str(leaf),
+        dst,
+        answers_file="leaf.yml",
+        parent_answers_file="middle.yml",
+        defaults=True,
+        quiet=True,
+        overwrite=True,
     )
     run_recopy(
         dst, answers_file="middle.yml", defaults=True, quiet=True, overwrite=True
     )
-    run_recopy(
-        dst, answers_file="root.yml", defaults=True, quiet=True, overwrite=True
-    )
+    run_recopy(dst, answers_file="root.yml", defaults=True, quiet=True, overwrite=True)
 
     assert (dst / "root.txt").read_text() == "middle"
     assert (dst / "middle.txt").read_text() == "root|leaf"
@@ -169,8 +178,13 @@ def test_templated_answers_path_resolves_children_for_later_prompts(
     _template(child, f"_parent_template: {parent}\n", "child.txt.jinja", "child")
     run_copy(str(parent), dst, defaults=True, quiet=True)
     run_copy(
-        str(child), dst, answers_file="child.yml", parent_answers_file="parent.yml",
-        defaults=True, quiet=True,
+        str(child),
+        dst,
+        answers_file="child.yml",
+        parent_answers_file="parent.yml",
+        defaults=True,
+        quiet=True,
+        overwrite=True,
     )
 
     run_copy(str(parent), dst, defaults=True, quiet=True, overwrite=True)
@@ -209,8 +223,13 @@ def test_linked_context_excludes_secret_hidden_and_reserved_values(
     )
     (dst / "parent.yml").write_text(yaml.safe_dump(parent_answers))
     run_copy(
-        str(child), dst, answers_file="child.yml", parent_answers_file="parent.yml",
-        defaults=True, quiet=True,
+        str(child),
+        dst,
+        answers_file="child.yml",
+        parent_answers_file="parent.yml",
+        defaults=True,
+        quiet=True,
+        overwrite=True,
     )
     child_answers = yaml.safe_load((dst / "child.yml").read_text())
     child_answers.update(
@@ -248,16 +267,24 @@ def test_linked_context_evaluates_when_from_recorded_answers(
         "{{ _parent.keys() | list | sort | join(',') }}",
     )
     run_copy(
-        str(parent), dst, answers_file="parent.yml", data={"reveal": reveal},
-        defaults=True, quiet=True,
+        str(parent),
+        dst,
+        answers_file="parent.yml",
+        data={"reveal": reveal},
+        defaults=True,
+        quiet=True,
     )
     parent_answers = yaml.safe_load((dst / "parent.yml").read_text())
     parent_answers["hidden_value"] = "stale" if not reveal else "visible"
     (dst / "parent.yml").write_text(yaml.safe_dump(parent_answers))
 
     run_copy(
-        str(child), dst, answers_file="child.yml", parent_answers_file="parent.yml",
-        defaults=True, quiet=True,
+        str(child),
+        dst,
+        answers_file="child.yml",
+        parent_answers_file="parent.yml",
+        defaults=True,
+        quiet=True,
     )
 
     assert (dst / "visible.txt").read_text() == expected
