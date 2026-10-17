@@ -8,6 +8,7 @@ watch: [copier]
 nav:
   - Overview: "index.md"
   - Creating a template: "creating.md"
+  - Linked templates: "linked-templates.md"
   - Configuring a template: "configuring.md"
   - Generating a project: "generating.md"
   - Updating a project: "updating.md"

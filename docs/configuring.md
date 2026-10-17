@@ -813,6 +813,15 @@ sources](#configuration-sources).
 Remember that **the key must be prefixed with an underscore if you use it in [the
 `copier.yml` file](#the-copieryml-file)**.
 
+### `accept_children`
+
+- Format: `bool`
+- Default value: `false`
+
+Set `_accept_children: true` in a parent template to allow linked child
+instances. See [linked templates](linked-templates.md) for declarations and
+examples.
+
 ### `answers_file`
 
 - Format: `str`
@@ -1557,6 +1566,17 @@ generation will be aborted and an error will be shown to the user.
     ```yaml title="copier.yml"
     _min_copier_version: "4.1.0"
     ```
+
+### `parent_template`
+
+- Format: `str`
+- Default value: unset
+
+Set `_parent_template` in a child template to the parent **repository** source,
+such as `gh:example/base-template`. The first child copy must select a parent
+instance with `--parent-answers-file`. A template can set both this and
+`_accept_children` to form a longer chain. See
+[linked templates](linked-templates.md#declare-a-link).
 
 ### `pretend`
 

@@ -71,6 +71,9 @@ Copier allows much more advanced templating: see the next chapter,
 [configuring a template](configuring.md), to see all the configurations options and
 their usage.
 
+Templates can also [link parent and child instances](linked-templates.md) to share
+answers and render fragments across repositories.
+
 ## Template helpers
 
 In addition to

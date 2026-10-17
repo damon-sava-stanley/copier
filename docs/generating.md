@@ -39,6 +39,11 @@ generating the project.
 
 All the available options are described with the `--help-all` option.
 
+For a child template that declares `_parent_template`, the first copy also needs
+`--parent-answers-file` (or `parent_answers_file` in `copier.run_copy`). See
+[linked templates](linked-templates.md#select-the-parent-instance-on-first-copy)
+for an example with several instances of one repository.
+
 ## Templates versions
 
 By default, Copier will copy from the last release found in template Git tags, sorted as

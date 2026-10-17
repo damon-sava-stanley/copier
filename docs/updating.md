@@ -51,6 +51,11 @@ conflict in one of two ways, controlled with the `--conflict` option:
 If the update results in conflicts, _you should review those manually_ before
 committing.
 
+For [linked templates](linked-templates.md#recopy-and-update), use
+`--answers-file` to select the instance to update. Copier also rerenders its
+affected relatives at their saved versions and merges their changed output with
+the same conflict modes.
+
 You probably don't want to lose important changes or to include merge conflicts in your
 Git history, but if you aren't careful, it's easy to make mistakes.
 

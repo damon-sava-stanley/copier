@@ -72,9 +72,10 @@ class CopierTemplateLoader(FileSystemLoader):
                 Copier template root.
         """
         candidate = Path(self.searchpath[0]).joinpath(*split_template_path(template))
-        if not candidate.resolve().is_relative_to(self.searchpath[0]):
+        path = candidate.resolve()
+        if not path.is_relative_to(self.searchpath[0]):
             raise ForbiddenPathError(
-                path=candidate, hint="File path is outside the template root"
+                path=path, hint="File path is outside the template root"
             )
         # codespell:ignore-next-line uptodate
         source, filename, uptodate = super().get_source(environment, template)
